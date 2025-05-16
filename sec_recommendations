@@ -1,0 +1,380 @@
+import streamlit as st
+import pandas as pd
+import os
+import logging
+import re
+from openai import OpenAI
+from docx import Document
+from io import BytesIO
+ 
+API_KEY = os.getenv("OPENAI_API_KEY")
+if not API_KEY:
+    logging.error("OPENAI_API_KEY is not set. Exiting.")
+    sys.exit(1)
+client = OpenAI(api_key=API_KEY)
+
+ # Configure logging
+logging.basicConfig(level=logging.ERROR)
+ 
+def ask_llm_question(question, model="gpt-3.5-turbo"):
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "You are an Information Security Advisor with extensive experience across multiple industries. "
+                    "Your expertise encompasses a deep understanding of cybersecurity regulations, industry standards, "
+                    "and frameworks such as GDPR, ISO/IEC 27001, and NIST-CSF. You are highly knowledgeable in securing cloud, "
+                    "on-premises, and hybrid environments and possess expertise across all key security domains, including risk management, "
+                    "compliance management, security architecture, security operations, monitoring, incident response, and security technology management. "
+                    "Your task is to provide practical, actionable recommendations for addressing cybersecurity gaps detected in an organization's environment. "
+                    "Your responses must be clear, concise, actionable, and contextually relevant."
+                    "Estimate the rough cost required to implement the recommendation. Consider the price ranges (Low: 0-50K, Medium: 50K-250K , High: 250K-1M, Very High: 1M+)"
+                    "Risk Mitigated should be proportionate to the severity of the Finding. Use Very High, High, Medium and Low values"
+                    "Prioirity should be defined based on the Risk Mitigated and Cost (cost benefit analysis). For example A recommendation should be given Very High Priority if the Risk mitigated is Very High and Cost is Low"
+                    "For each input, include the following fields in the response: Recommendation, Recommendation Details, Risk mitigated, Cost $ (low: 0-50K, Medium: 50K-250K , High: 250K-1M, Very High: 1M+), Priority.\n"
+                    "Example1:\n"
+                    "Finding: Third-party security risk management is not well defined."
+                    "The main risk management process with third-party vendors is done by the Exception to Policy (ETP) process."
+                    "There is a yearly audit (ISAE3000D) conducted by ABC, and there are focused security awareness trainings.\n"
+                    "Recommendation: Establish a third-party security governance framework.\n"
+                    "Recommendation Details:\n"
+                    "1. Establish a third-party governance framework (including both policy and process). It should include third-party assessment, profiling, selection, "
+                    "   contract management, SLAs, performance reporting, and auditing.\n"
+                    "2. Set information security requirements for third parties who have access to ABC data or systems, including regular audits to assess compliance with ABC requirements.\n"
+                    "3. Develop the policy and process collaboratively with the CISO, DPO, procurement team, legal, and business units managing key ABC vendor relationships.\n"
+                    "4. Leverage the existing GRC tool to automate these activities.\n"
+                    "5. Integrate third-party risk management into the overall risk management framework.\n"
+                    "Additional References: ISO 27001; A.6.2.3 / NIST SP 800-53 CA-3, PS-7, SA-9.\n"
+                    "Risk mitigated: High\n"
+                    "Cost $ (Low: 0-50K, Medium: 50K-250K , High: 250K-1M, Very High: 1M+): Low\n"
+                    "Priority: High\n\n"
+                    "Example2:\n"
+                    "Finding: The CISO office does not have it's own budget for security initiatives, apart from the allocated staff."
+                    " All security programs take place in the business units."
+                    "Recommendation: Allocate dedicated budget to CISO\n"
+                    "Recommendation Details:\n"
+                    "CISO office should be allotted with dedicated budget to implement certain initiatives such as Security Awareness, third party maturity/risk assessments which should be driven centrally.\n"
+                    "Risk mitigated: Medium\n"
+                    "Cost $ (Low: 0-50K, Medium: 50K-250K , High: 250K-1M, Very High: 1M+): High\n"
+                    "Priority: Medium\n\n"
+                )},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=1500,
+            temperature=0.1,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"Error in ask_llm_question: {str(e)}")
+        return "An error occurred while processing your request. Please try again later."
+ 
+def extract_recommendation_details(response):
+    match_rec = re.search(r"Recommendation:\s*(.*?)(?:\nRecommendation Details:|$)", response, re.DOTALL)
+    match_details = re.search(r"Recommendation Details:\s*(.*?)(?:\nRisk mitigated:|$)", response, re.DOTALL)
+    match_risk = re.search(r"Risk mitigated:\s*(.*?)(?:\n|$)", response, re.DOTALL)
+    match_cost = re.search(r"Cost \$ \(.*?\):\s*(.*?)(?:\n|$)", response, re.DOTALL)
+    match_priority = re.search(r"Priority:\s*(.*?)(?:\n|$)", response, re.DOTALL)
+    
+    recommendation = match_rec.group(1).strip() if match_rec else ""
+    recommendation_details = match_details.group(1).strip() if match_details else ""
+    risk_mitigated = match_risk.group(1).strip() if match_risk else ""
+    cost = match_cost.group(1).strip() if match_cost else ""
+    priority = match_priority.group(1).strip() if match_priority else ""
+    
+    return recommendation, recommendation_details, risk_mitigated, cost, priority
+ 
+ 
+ 
+def process_excel(file):
+    try:
+        df = pd.read_excel(file)
+        if "Finding" not in df.columns:
+            return None, None, None, "The uploaded file must have a 'Finding' column."
+ 
+        with st.spinner("Processing findings... This may take a while."):
+            df["Response"] = df["Finding"].apply(lambda x: ask_llm_to_generate_report(f"Provide a recommendation for the following finding:\n\nFinding: {x}"))
+            df["Recommendation"], df["Recommendation Details"], df["Risk Mitigated"], df["Cost"], df["Priority"] = zip(*df["Response"].apply(extract_recommendation_details))
+            df.drop(columns=["Response"], inplace=True)
+ 
+        # Generate the assessment report (Word document)
+        report_buffer = generate_report(df)
+ 
+        # Convert the processed DataFrame to a CSV format for download
+        excel_buffer = BytesIO()
+        df.to_excel(excel_buffer, index=False, engine="xlsxwriter")
+        excel_buffer.seek(0)
+ 
+ 
+        # Define the directory and file paths
+        SAVE_DIR = "C:/TEST/AI_recommendations_output"
+        EXCEL_SAVE_PATH = os.path.join(SAVE_DIR, "Processed_Findings.xlsx")
+        WORD_SAVE_PATH = os.path.join(SAVE_DIR, "Cybersecurity_Assessment_Report.docx")
+ 
+        # Ensure the directory exists
+        os.makedirs(SAVE_DIR, exist_ok=True)
+ 
+        # Save Word Report to Disk
+        try:
+            with open(WORD_SAVE_PATH, "wb") as f:
+                f.write(report_buffer.getvalue())
+        except PermissionError:
+            logging.error(f"Permission denied: Unable to save {WORD_SAVE_PATH}. Please check file permissions.")
+ 
+        # Save Excel file to Disk
+        try:
+            with open(EXCEL_SAVE_PATH, "wb") as f:
+                f.write(excel_buffer.getvalue())
+        except PermissionError:
+            logging.error(f"Permission denied: Unable to save {EXCEL_SAVE_PATH}. Please check file permissions.")
+ 
+ 
+ 
+ 
+        return df, report_buffer, excel_buffer, None  # Returns both files and no error
+    except Exception as e:
+        logging.error(f"Error processing findings file: {str(e)}")
+        return None, None, None, "An error occurred while processing the file. Please check the format and try again."
+ 
+ 
+ 
+def process_consultant_comments(file):
+    try:
+        df = pd.read_excel(file)
+        if "Question" not in df.columns or "Consultant Comment" not in df.columns:
+            return None, None, None, "The uploaded file must have 'Question' and 'Consultant Comment' columns."
+ 
+        with st.spinner("Processing consultant comments... This may take a while."):
+            # Convert consultant comments into findings
+            df["Finding"] = df.apply(lambda row: ask_llm_to_generate_report(
+                f"Convert the following question and consultant comment into a cybersecurity finding:\n\n"
+                f"Question: {row['Question']}\nConsultant Comment: {row['Consultant Comment']}"
+            ), axis=1)
+ 
+            # Generate recommendations based on findings
+            df["Response"] = df["Finding"].apply(lambda x: ask_llm_to_generate_report(
+                f"Provide a recommendation for the following finding:\n\nFinding: {x}"
+            ))
+ 
+            df["Recommendation"], df["Recommendation Details"], df["Risk Mitigated"], df["Cost"], df["Priority"] = zip(
+                *df["Response"].apply(extract_recommendation_details)
+            )
+            df.drop(columns=["Response"], inplace=True)
+ 
+        # Generate the assessment report (Word document)
+        report_buffer = generate_report(df)
+ 
+        # Convert the processed DataFrame to an Excel format for download
+        excel_buffer = BytesIO()
+        df.to_excel(excel_buffer, index=False, engine="xlsxwriter")
+        excel_buffer.seek(0)
+ 
+        # Define the directory and file paths
+        SAVE_DIR = "C:/TEST/AI_recommendations_output"
+        EXCEL_SAVE_PATH = os.path.join(SAVE_DIR, "Processed_Consultant_Comments.xlsx")
+        WORD_SAVE_PATH = os.path.join(SAVE_DIR, "Consultant_Comments_Assessment_Report.docx")
+ 
+        # Ensure the directory exists
+        os.makedirs(SAVE_DIR, exist_ok=True)
+ 
+        # Save Word Report to Disk
+        try:
+            with open(WORD_SAVE_PATH, "wb") as f:
+                f.write(report_buffer.getvalue())
+        except PermissionError:
+            logging.error(f"Permission denied: Unable to save {WORD_SAVE_PATH}. Please check file permissions.")
+ 
+        # Save Excel file to Disk
+        try:
+            with open(EXCEL_SAVE_PATH, "wb") as f:
+                f.write(excel_buffer.getvalue())
+        except PermissionError:
+            logging.error(f"Permission denied: Unable to save {EXCEL_SAVE_PATH}. Please check file permissions.")
+ 
+        return df, report_buffer, excel_buffer, None  # Returns both files and no error
+    except Exception as e:
+        logging.error(f"Error processing consultant comments file: {str(e)}")
+        return None, None, None, "An error occurred while processing the file. Please check the format and try again."
+ 
+ 
+ 
+ 
+ 
+def ask_llm_to_generate_report(question, model="gpt-4"):
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": question}],
+            max_tokens=2000,
+            temperature=0.7,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"Error in ask_llm_to_generate_report: {str(e)}")
+        return "An error occurred while processing the request."
+ 
+def generate_report(df):
+    doc = Document()
+ 
+    # Title
+    doc.add_heading("Cybersecurity Assessment Report", level=1)
+ 
+    # Prepare findings summary for AI
+    findings_text = "\n".join([f"{idx+1}. {row['Finding']} (Recommendation: {row['Recommendation']})" for idx, row in df.iterrows()])
+ 
+    # Generate AI-powered Executive Summary
+    executive_summary_prompt = (
+        "Summarize the following cybersecurity assessment findings in a structured executive summary. "
+        "Ensure the summary is concise and highlights key security gaps, high-risk areas, and overall security posture.\n\n"
+        f"Findings:\n{findings_text}"
+    )
+    executive_summary = ask_llm_to_generate_report(executive_summary_prompt)
+ 
+    doc.add_heading("Executive Summary", level=2)
+    doc.add_paragraph(executive_summary)
+ 
+    # Generate People-Process-Technology Summary
+    ppt_summary_prompt = (
+        "Analyze the following cybersecurity findings and classify issues based on People, Process, and Technology (PPT). "
+        "Summarize challenges in each category and suggest high-level improvements.\n\n"
+        f"Findings:\n{findings_text}"
+    )
+    ppt_summary = ask_llm_to_generate_report(ppt_summary_prompt)
+ 
+    doc.add_heading("People-Process-Technology Summary", level=2)
+    doc.add_paragraph(ppt_summary)
+ 
+    # Key Findings and Recommendations
+    doc.add_heading("Key Findings and Recommendations", level=2)
+    for idx, row in df.iterrows():
+        doc.add_heading(f"Finding {idx + 1}:", level=3)
+        doc.add_paragraph(f"**Finding:** {row['Finding']}")
+        doc.add_paragraph(f"**Recommendation:** {row['Recommendation']}")
+        doc.add_paragraph(f"**Details:** {row['Recommendation Details']}")
+        doc.add_paragraph(f"**Risk Mitigated:** {row['Risk Mitigated']}")
+        doc.add_paragraph(f"**Cost:** {row['Cost']}")
+        doc.add_paragraph(f"**Priority:** {row['Priority']}")
+        doc.add_paragraph("\n")
+ 
+    # Generate AI-powered Improvement Roadmap
+    roadmap_prompt = (
+        "Based on the following cybersecurity findings and recommendations, generate a structured improvement roadmap. "
+        "The roadmap should include short-term, mid-term, and long-term actions based on priority and risk mitigation impact.\n\n"
+        f"Findings and Recommendations:\n{findings_text}"
+    )
+    improvement_roadmap = ask_llm_to_generate_report(roadmap_prompt)
+ 
+    doc.add_heading("Improvement Roadmap", level=2)
+    doc.add_paragraph(improvement_roadmap)
+ 
+    # Save to BytesIO buffer
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+ 
+ 
+ 
+ 
+# Streamlit App UI
+st.title("Cybersecurity Recommendation Tool")
+ 
+st.subheader("Ask a Question")
+question = st.text_area("Enter your question here:", height=100)
+if st.button("Get Recommendation"):
+    if question.strip():
+        with st.spinner("Generating recommendation..."):
+            response = ask_llm_question(question)
+        st.markdown(f"**Recommendation:**\n\n{response}")
+    else:
+        st.warning("Please enter a valid question.")
+ 
+st.subheader("Produce Recommendations - From an Excel File with Findings")
+file1 = st.file_uploader("Upload an Excel file:", type=["xlsx"])
+ 
+# Check if file is uploaded
+if file1 and st.button("Process Findings and Generate Report"):
+    processed_df, report_buffer, excel_buffer, error = process_excel(file1)
+ 
+    if processed_df is not None:
+        # Store both files persistently in session state
+        st.session_state["report_buffer"] = report_buffer
+        st.session_state["excel_buffer"] = excel_buffer
+        st.success("Processing complete! Download your files below.")
+ 
+# Ensure the download buttons persist even after clicking
+if "report_buffer" in st.session_state and "excel_buffer" in st.session_state:
+    st.download_button(
+        label="📄 Download Cybersecurity Assessment Report (Word)",
+        data=st.session_state["report_buffer"],
+        file_name="Cybersecurity_Assessment_Report.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+ 
+    st.download_button(
+        label="📊 Download Processed Findings (Excel)",
+        data=st.session_state["excel_buffer"],
+        file_name="Processed_Findings.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+ 
+ 
+ 
+st.subheader("Produce Recommendations - From an Excel File with Questions and Consultant Comments")
+file2 = st.file_uploader("Upload an Excel file with consultant comments:", type=["xlsx"])
+ 
+if file2 and st.button("Process Consultant Comments and Generate Report"):
+    processed_df, report_buffer, excel_buffer, error = process_consultant_comments(file2)
+ 
+    if processed_df is not None:
+        st.success("Processing complete! Download your files below.")
+ 
+        # Download Word Report
+        st.download_button(
+            label="📄 Download Consultant Comments Assessment Report (Word)",
+            data=report_buffer,
+            file_name="Consultant_Comments_Assessment_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+ 
+        # Download Processed Excel File
+        st.download_button(
+            label="📊 Download Processed Consultant Comments (Excel)",
+            data=excel_buffer,
+            file_name="Processed_Consultant_Comments.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.error(error)
+ 
+ 
+ 
+# Upload Findings and Recommendations File to generate report
+st.subheader("Generate report - From an Excel File with Findings and Recommendations")
+file1 = st.file_uploader("Upload an Excel file with required columns ('Finding', 'Recommendation', 'Recommendation Details', 'Risk Mitigated', 'Cost', 'Priority'):", type=["xlsx"])
+ 
+# Process the uploaded file
+processed_df = None
+error_message = None
+ 
+if file1:
+    processed_df, error_message = process_excel(file1)
+ 
+if processed_df is not None:
+    st.success("File uploaded successfully! You can now generate the assessment report.")
+else:
+    if error_message:
+        st.error(error_message)
+ 
+# Button to Generate Report
+if processed_df is not None:
+    if st.button("Generate Assessment Report"):
+        report_buffer = generate_report(processed_df)
+        
+        # Download button for the report
+        st.download_button(
+            label="Download Assessment Report",
+            data=report_buffer,
+            file_name="Cybersecurity_Assessment_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
